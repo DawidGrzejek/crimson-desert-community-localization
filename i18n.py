@@ -39,8 +39,11 @@ def current():
     return _current
 
 
-def tr(key, lang=None, **kwargs):
-    """Translated text for key; lang overrides the UI language (e.g. 'en' for AI instructions)."""
+def tr(key, lang=None, /, **kwargs):
+    """Translated text for key; lang overrides the UI language (e.g. 'en' for AI instructions).
+
+    lang is positional-only, so "lang" can also be a placeholder in the text.
+    """
     text = _load(lang or _current).get(key)
     if text is None:
         text = _load(DEFAULT).get(key, key)

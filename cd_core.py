@@ -7,21 +7,26 @@ the game.
 """
 
 import collections
+import contextlib
 import datetime
+import io
 import json
 import os
 import re
+import runpy
 import shutil
 import struct
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 from i18n import tr
 
-BASE_DIR = Path(__file__).resolve().parent
-TOOLS_DIR = BASE_DIR / "tools"
+# Program files (code, lang/, tools/) and user data (projects, tasks, backups, settings).
+# They are the same folder, except in a packaged build, where data lives next to the executable.
+RESOURCE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else RESOURCE_DIR
+TOOLS_DIR = RESOURCE_DIR / "tools"
 CONFIG_PATH = BASE_DIR / "translator_config.json"
 
 
@@ -124,6 +129,8 @@ def find_game_dirs():
     vdfs = [
         home / ".local/share/Steam/steamapps/libraryfolders.vdf",
         home / ".steam/steam/steamapps/libraryfolders.vdf",
+        Path("C:/Program Files (x86)/Steam/steamapps/libraryfolders.vdf"),
+        Path("C:/Program Files/Steam/steamapps/libraryfolders.vdf"),
     ]
     libs = []
     for vdf in vdfs:
@@ -131,7 +138,7 @@ def find_game_dirs():
             text = vdf.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        libs += re.findall(r'"path"\s+"([^"]+)"', text)
+        libs += [p.replace("\\\\", "/") for p in re.findall(r'"path"\s+"([^"]+)"', text)]
     libs += [str(home / ".local/share/Steam")]
     found = []
     for lib in libs:
@@ -332,6 +339,36 @@ def check_entry(source, target, lang=None):
 
 # ---------------------------------------------------------------- projects
 
+def game_stamp(game_dir, folder):
+    """Size and modification time of a language package index; it changes when the game is updated."""
+    try:
+        st = (Path(game_dir) / folder / "0.pamt").stat()
+        return [st.st_size, int(st.st_mtime)]
+    except OSError:
+        return None
+
+
+def game_updated(project):
+    """True if the original-language package changed since the project was exported."""
+    stamp = project.meta.get("game_stamp")
+    return stamp is not None and game_stamp(project.game_dir, project.src_folder) != stamp
+
+
+def refresh_project(project, progress=None):
+    """Re-read the game texts after a game update, keeping all edits (changed originals become 'outdated')."""
+    project.save_all()
+    src = {"folder": project.src_folder, "lang": project.src_lang}
+    tgt = {"folder": project.tgt_folder, "lang": project.tgt_lang}
+    return export_project(project.game_dir, src, tgt, project.files, progress)
+
+
+def resolve_outdated(entry):
+    """Mark an outdated correction as checked against the new original."""
+    entry.pop("outdated", None)
+    entry.pop("old_source", None)
+    refresh_issues(entry)
+
+
 def project_dir_name(src_lang, src_folder, tgt_lang, tgt_folder):
     return f"{src_lang}-{tgt_lang}_{src_folder}-{tgt_folder}"
 
@@ -356,6 +393,9 @@ class Project:
         self._cache = {}
         self._charset = None
         self.dirty = set()
+        # Optional voice data (set with attach_voice): a cd_audio.VoiceLibrary and the transcripts
+        self.voice = None
+        self.transcripts = {}
 
     # meta shortcuts
     @property
@@ -395,9 +435,32 @@ class Project:
             with open(self.data_path(name), encoding="utf-8") as f:
                 entries = json.load(f)["entries"]
             for e in entries:
+                self._annotate(name, e)
                 refresh_issues(e)
             self._cache[name] = entries
         return self._cache[name]
+
+    def _annotate(self, name, e):
+        e["_file"] = name
+        e["_dur"] = self.voice.duration(name, e["key"]) if self.voice else None
+        e["_heard"] = self.transcripts.get(f"{name}|{e['key']}")
+
+    def attach_voice(self, library, transcripts):
+        """Use voice durations and transcripts in the checks of all loaded entries."""
+        self.voice = library
+        self.transcripts = transcripts
+        for name, entries in self._cache.items():
+            for e in entries:
+                self._annotate(name, e)
+                refresh_issues(e)
+
+    def neighbours(self, name, key, before=2, after=2):
+        """Entries around a key in the order of the game file (the context of a dialogue line)."""
+        entries = self.load_file(name)
+        index = next((i for i, e in enumerate(entries) if e["key"] == key), None)
+        if index is None:
+            return [], []
+        return entries[max(0, index - before):index], entries[index + 1:index + 1 + after]
 
     def save_file(self, name):
         entries = self._cache.get(name)
@@ -430,15 +493,82 @@ class Project:
             "errors": sum(1 for e in entries if e["_errors"]),
             "flagged": sum(1 for e in entries if e.get("flag")),
             "ai": sum(1 for e in entries if e.get("ai") is not None),
+            "voice": sum(1 for e in entries if e["_voice_issue"]),
+            "timing": sum(1 for e in entries if e["_timing_issue"]),
+            "outdated": sum(1 for e in entries if e.get("outdated")),
+            "reviewed": sum(1 for e in entries if e.get("reviewed")),
         }
+
+
+# Subtitle limits: translation much longer than the original, or too fast to read while the line is spoken
+LONG_RATIO = 1.5
+LONG_MIN_CHARS = 15
+MAX_READING_SPEED = 20  # characters per second
+# Fast speech is fine if the original is just as fast: only flag translations clearly longer than it
+SPEED_RELATIVE = 1.25
+VOICE_MISMATCH_RATIO = 0.6
+
+
+def visible_text(text):
+    """Text as shown on screen: tags removed, link text after # kept, <br/> as a space."""
+    return re.sub(r"\s+", " ", TOKEN_RE.sub(lambda m: " " if m.group(3) is not None else (m.group(2) or "#")[1:], text)).strip()
+
+
+def timing_warnings(entry, text, lang=None):
+    """Length and reading-speed warnings for a subtitle (needs the voice duration for the speed)."""
+    warnings = []
+    src_len, tgt_len = len(visible_text(entry["source"])), len(visible_text(text))
+    if src_len >= LONG_MIN_CHARS and tgt_len > src_len * LONG_RATIO:
+        warnings.append(tr("check.longer", lang, pct=round(100 * (tgt_len - src_len) / src_len)))
+    duration = entry.get("_dur")
+    if (duration and duration > 0.5 and tgt_len / duration > MAX_READING_SPEED
+            and tgt_len > src_len * SPEED_RELATIVE):
+        warnings.append(tr("check.speed", lang, cps=round(tgt_len / duration, 1), max=MAX_READING_SPEED,
+                           sec=duration))
+    return warnings
+
+
+def voice_warning(entry, lang=None):
+    """Warning when the original subtitle differs from what the voice actually says."""
+    heard = entry.get("_heard")
+    if heard and heard.get("ratio", 1) < VOICE_MISMATCH_RATIO:
+        return tr("check.voice", lang, text=heard["text"])
+    return None
 
 
 def refresh_issues(entry):
     entry["_errors"], entry["_warnings"] = check_entry(entry["source"], entry["target"])
+    timing = timing_warnings(entry, entry["target"])
+    voice = voice_warning(entry)
+    entry["_timing_issue"] = bool(timing)
+    entry["_voice_issue"] = voice is not None
+    entry["_warnings"] += timing + ([voice] if voice else [])
+    if entry.get("outdated"):
+        entry["_warnings"].append(tr("check.outdated", old=entry.get("old_source", "")))
     if entry.get("ai") is not None:
         entry["_ai_errors"], _ = check_entry(entry["source"], entry["ai"])
     else:
         entry["_ai_errors"] = []
+
+
+def merge_entry(old, key, source, game_text):
+    """Project entry for a key after (re-)reading the game; old is the entry from the previous export."""
+    e = {"key": key, "source": source}
+    if not old:
+        e["target"] = e["original"] = game_text
+        return e
+    # The game holds either its own text or our installed edit; anything else is an official update
+    e["original"] = old["original"] if game_text in (old["target"], old["original"]) else game_text
+    edited = old["target"] != old["original"]
+    e["target"] = old["target"] if edited else e["original"]
+    for extra in ("flag", "note", "ai", "ai_reason", "reviewed", "outdated", "old_source"):
+        if extra in old:
+            e[extra] = old[extra]
+    if edited and old["source"] and old["source"] != source:
+        # The original line changed in a game update after we corrected the translation
+        e["outdated"] = True
+        e.setdefault("old_source", old["source"])
+    return e
 
 
 def export_project(game_dir, src, tgt, files, progress=None):
@@ -484,17 +614,7 @@ def export_project(game_dir, src, tgt, files, progress=None):
 
         entries = []
         for _, key, text in tgt_records:
-            old = existing.get(key)
-            e = {"key": key, "source": src_texts.get(key, "")}
-            if old:
-                e["target"] = old["target"]
-                e["original"] = old["original"]
-                for extra in ("flag", "note", "ai", "ai_reason"):
-                    if extra in old:
-                        e[extra] = old[extra]
-            else:
-                e["target"] = text
-                e["original"] = text
+            e = merge_entry(existing.get(key), key, src_texts.get(key, ""), text)
             charset.update(e["original"])
             entries.append(e)
 
@@ -504,6 +624,7 @@ def export_project(game_dir, src, tgt, files, progress=None):
             meta["files"].append(name)
 
     meta["files"].sort()
+    meta["game_stamp"] = game_stamp(game, src["folder"])
     charset.discard("\n")
     (pdir / "charset.txt").write_text("".join(sorted(charset)), encoding="utf-8")
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -539,6 +660,64 @@ def build_glossary(project):
     return rows
 
 
+def _stem(word):
+    """Rough stem that survives inflection (Polish, German, …): the first ~70% of the word."""
+    word = word.lower()
+    return word if len(word) <= 4 else word[:max(4, round(len(word) * 0.7))]
+
+
+def _same_name(a, b):
+    """True if two translations of a name are just different inflected forms."""
+    wa, wb = a.split(), b.split()
+    return len(wa) == len(wb) and all(_stem(x) == _stem(y) or x.lower().startswith(_stem(y))
+                                      or y.lower().startswith(_stem(x)) for x, y in zip(wa, wb))
+
+
+def terminology_report(project, files=None, progress=None):
+    """Inconsistent names: [{"name", "expected", "variants", "entries": [(file, key)]}], worst first.
+
+    Names come from the game's own links ({StaticInfo:…#name}). Reported are names translated in
+    clearly different ways, and entries whose original mentions a name in plain text while the
+    translation uses none of its known forms.
+    """
+    glossary = build_glossary(project)
+    names = {}
+    for _ident, sname, best, others in glossary:
+        if len(sname) < 4 or not sname[:1].isupper():
+            continue
+        variants = [best] + [v for v in others.split(" | ") if v]
+        info = names.setdefault(sname, {"name": sname, "expected": best, "variants": set(), "entries": [],
+                                        "forms": set()})
+        info["forms"].update(v for v in variants if _same_name(v, best))
+        info["variants"].update(v for v in variants if not _same_name(v, best))
+    if not names:
+        return []
+    pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")\b")
+    files = files or project.files
+    for i, name in enumerate(files):
+        if progress:
+            progress(i, len(files), name)
+        for e in project.load_file(name):
+            src = visible_text(e["source"])
+            if not src:
+                continue
+            tgt = visible_text(e["target"]).lower()
+            for found in set(pattern.findall(src)):
+                info = names[found]
+                stems = [[_stem(w) for w in form.split()] for form in info["forms"]]
+                if not any(all(st in tgt for st in form) for form in stems):
+                    info["entries"].append((name, e["key"]))
+    if progress:
+        progress(len(files), len(files), "")
+    report = []
+    for info in names.values():
+        if len(info["variants"]) > 0 or info["entries"]:
+            report.append({"name": info["name"], "expected": info["expected"],
+                           "variants": sorted(info["variants"]), "entries": info["entries"]})
+    report.sort(key=lambda r: (-(len(r["variants"]) > 0), -len(r["entries"]), r["name"]))
+    return report
+
+
 def generate_ai_task(project, files, mode, chunk_size=200):
     """Write an AI task package. mode: 'all', 'errors', 'problems', 'flagged', 'edited'.
 
@@ -564,8 +743,18 @@ def generate_ai_task(project, files, mode, chunk_size=200):
                 continue
             if mode == "edited" and e["target"] == e["original"]:
                 continue
+            if mode == "voice" and not (e["_voice_issue"] or e["_timing_issue"] or e.get("outdated")):
+                continue
             rec = {"id": f"{name}|{e['key']}", src: e["source"], tgt: e["target"]}
-            issues = sum(check_entry(e["source"], e["target"], "en"), [])
+            voice = voice_warning(e, "en")
+            issues = sum(check_entry(e["source"], e["target"], "en"), []) + timing_warnings(e, e["target"], "en")
+            if voice:
+                issues.append(voice)
+                rec["voice"] = e["_heard"]["text"]
+            if e.get("_dur"):
+                rec["seconds"] = e["_dur"]
+            if e.get("outdated"):
+                issues.append(tr("check.outdated", "en", old=e.get("old_source", "")))
             if issues:
                 rec[L["issues"]] = issues
             if e.get("note"):
@@ -587,7 +776,7 @@ def generate_ai_task(project, files, mode, chunk_size=200):
             f.write("\t".join(x.replace("\t", " ") for x in row) + "\n")
 
     (out / L["charset"]).write_text(project.charset(), encoding="utf-8")
-    shutil.copy(BASE_DIR / "ai_check.py", out / L["check"])
+    shutil.copy(RESOURCE_DIR / "ai_check.py", out / L["check"])
 
     task = {
         "source_lang": src,
@@ -618,6 +807,8 @@ def _instructions(task, files, glossary_size):
         "problems": "only entries where the automatic check found a problem or a suspicion (`issues` field)",
         "flagged": "only entries the user flagged for review",
         "edited": "only entries already changed by the user (for verification)",
+        "voice": "only entries whose subtitle does not fit the voice-over (different wording, too long, "
+                 "too fast to read) or whose original changed in a game update",
     }[task["mode"]]
     first = task["parts"][0] if task["parts"] else "part_001.jsonl"
     return f"""# Task: proofread the {tn} translation of Crimson Desert ({sn} → {tn})
@@ -650,8 +841,14 @@ This folder is a self-contained package. Work only inside it.
 Line format in `data/`:
 
 ```json
-{{"id": "ui.paloc|4294967698", "{s}": "original text", "{t}": "current translation", "issues": ["optional: detected problems"], "note": "optional: user's note"}}
+{{"id": "ui.paloc|4294967698", "{s}": "original text", "{t}": "current translation", "issues": ["optional: detected problems"], "note": "optional: user's note", "voice": "optional", "seconds": 4.2}}
 ```
+
+- `voice` – what the voice actor actually says (speech recognition of the {sn} voice-over). It is present
+  only when it differs from the `{s}` subtitle. **The translation must match what is spoken**, so translate
+  the meaning of `voice` (speech recognition may misspell names – take names from `{s}` and the glossary).
+- `seconds` – length of the spoken line. A subtitle must be readable in that time: keep it at most about
+  {MAX_READING_SPEED} characters per second and roughly as long as the original.
 
 ## What to fix
 
@@ -792,41 +989,52 @@ def _original_backup_dir(folder):
 
 
 def _meta_patch(game, folder):
-    result = subprocess.run(
-        [sys.executable, str(TOOLS_DIR / "Meta_Patch.py"), str(game / folder)],
-        capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(tr("core.meta_failed", output=result.stdout + result.stderr))
-    return "\n".join(line for line in result.stdout.splitlines() if not line.startswith("[=]"))
+    """Recompute the package checksums in meta/0.papgt (runs tools/Meta_Patch.py in this process)."""
+    out = io.StringIO()
+    argv = sys.argv
+    sys.argv = [str(TOOLS_DIR / "Meta_Patch.py"), str(game / folder)]
+    try:
+        with contextlib.redirect_stdout(out):
+            runpy.run_path(sys.argv[0], run_name="__main__")
+    except Exception as e:
+        raise RuntimeError(tr("core.meta_failed", output=f"{out.getvalue()}{e}")) from e
+    finally:
+        sys.argv = argv
+    return "\n".join(line for line in out.getvalue().splitlines() if not line.startswith("[=]"))
 
 
-def pending_changes(project):
-    """Return [(file name, new wrapped bytes)] that differ from the game."""
-    game = Path(project.game_dir)
-    entries = list_paloc_entries(game / project.tgt_folder)
+def compute_changes(game_dir, folder, texts):
+    """[(file name, bytes to write, expected raw text data)] for {file: {key: new text}} that differ from the game."""
+    entries = list_paloc_entries(Path(game_dir) / folder)
     changes = []
-    for name in project.files:
+    for name, new_texts in texts.items():
         if name not in entries:
             continue
         cur_raw, wrapped = read_paloc(entries[name])
         records, tail = parse_paloc(cur_raw)
-        targets = {e["key"]: e["target"] for e in project.load_file(name)}
-        new_raw = build_paloc([(m, k, targets.get(k, v)) for m, k, v in records], tail)
+        new_raw = build_paloc([(m, k, new_texts.get(k, v)) for m, k, v in records], tail)
         if new_raw != cur_raw:
-            changes.append((name, wrap_paloc(new_raw) if wrapped else new_raw))
+            changes.append((name, wrap_paloc(new_raw) if wrapped else new_raw, new_raw))
     return changes
 
 
-def install(project, log=print):
-    """Write all edited translations into the game files."""
-    game = Path(project.game_dir)
-    folder = project.tgt_folder
-    project.save_all()
-    changes = pending_changes(project)
-    if not changes:
-        log(tr("core.nothing_to_install"))
-        return 0
+def pending_changes(project):
+    """Changes needed so the game contains the project's translation."""
+    texts = {name: {e["key"]: e["target"] for e in project.load_file(name)} for name in project.files}
+    return compute_changes(project.game_dir, project.tgt_folder, texts)
 
+
+def _restore_folder(game, folder, backup):
+    for f in (backup / folder).iterdir():
+        shutil.copy2(f, game / folder / f.name)
+
+
+def write_changes(game_dir, folder, changes, log=print):
+    """Back up, repack the changed text files, verify them and update checksums.
+
+    If anything fails, the language folder is rolled back to the backup taken just before.
+    """
+    game = Path(game_dir)
     original = _original_backup_dir(folder)
     if not original.exists():
         _backup(game, folder, original)
@@ -836,16 +1044,36 @@ def install(project, log=print):
     log(tr("core.backup", path=stamp))
 
     pamt = game / folder / "0.pamt"
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, data in changes:
-            tmp_file = Path(tmp) / name
-            tmp_file.write_bytes(data)
-            # Offsets shift after every repack, so re-read the index each time
-            entry = list_paloc_entries(game / folder)[name]
-            repack_entry(str(tmp_file), entry, pamt_path=str(pamt))
-            log(tr("core.installed", name=name))
-    log(_meta_patch(game, folder).strip())
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, data, _ in changes:
+                tmp_file = Path(tmp) / name
+                tmp_file.write_bytes(data)
+                # Offsets shift after every repack, so re-read the index each time
+                entry = list_paloc_entries(game / folder)[name]
+                repack_entry(str(tmp_file), entry, pamt_path=str(pamt))
+                log(tr("core.installed", name=name))
+        entries = list_paloc_entries(game / folder)
+        for name, _, expected in changes:
+            if read_paloc(entries[name])[0] != expected:
+                raise RuntimeError(tr("core.verify_failed", name=name))
+        log(tr("core.verified", n=len(changes)))
+        log(_meta_patch(game, folder).strip())
+    except Exception as e:
+        _restore_folder(game, folder, stamp)
+        _meta_patch(game, folder)
+        raise RuntimeError(tr("core.rolled_back", error=e, path=stamp)) from e
     return len(changes)
+
+
+def install(project, log=print):
+    """Write all edited translations into the game files."""
+    project.save_all()
+    changes = pending_changes(project)
+    if not changes:
+        log(tr("core.nothing_to_install"))
+        return 0
+    return write_changes(project.game_dir, project.tgt_folder, changes, log)
 
 
 def restore_original(project, log=print):
@@ -854,8 +1082,7 @@ def restore_original(project, log=print):
     original = _original_backup_dir(folder)
     if not original.exists():
         raise RuntimeError(tr("core.no_original"))
-    for f in (original / folder).iterdir():
-        shutil.copy2(f, game / folder / f.name)
+    _restore_folder(game, folder, original)
     log(tr("core.restored", folder=folder, path=original))
     # Recompute checksums instead of restoring 0.papgt, so other mods stay valid
     log(_meta_patch(game, folder).strip())

@@ -1,3 +1,6 @@
 PyQt6
 lz4
 cryptography
+numpy
+# optional: speech recognition of the voice-over (tab 5)
+faster-whisper

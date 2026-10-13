@@ -1,0 +1,7 @@
+line-length = 120
+target-version = "py310"
+extend-exclude = ["tools", ".venv", "ai_zadania", "ai_tasks", "projekty", "projects"]
+
+[lint]
+select = ["E", "F", "W", "B"]
+ignore = ["B008", "B905", "E501"]

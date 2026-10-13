@@ -9,7 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QAbstractTableModel, QLocale, QModelIndex, QSortFilterProxyModel, Qt, QTimer
+from PyQt6.QtCore import QAbstractTableModel, QLocale, QModelIndex, QSortFilterProxyModel, Qt, QTimer, QUrl
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtGui import QColor, QFont, QKeySequence, QShortcut, QSyntaxHighlighter, QTextCharFormat
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox, QInputDialog,
@@ -18,12 +19,19 @@ from PyQt6.QtWidgets import (
     QSplitter, QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
+import cd_ai_api as ai_api
+import cd_audio as audio
 import cd_core as core
+import cd_patch as patch
+import cd_stt as stt
 import i18n
+from cd_ui_common import start_worker
+from cd_ui_voice import VoiceTab
 from i18n import tr
 
-FILTERS = ["all", "errors", "warnings", "edited", "flagged", "ai"]
-AI_MODES = ["errors", "problems", "flagged", "edited", "all"]
+FILTERS = ["all", "errors", "warnings", "edited", "flagged", "ai", "voice", "timing", "outdated",
+           "reviewed", "unreviewed"]
+AI_MODES = ["errors", "problems", "voice", "flagged", "edited", "all"]
 
 # Open windows; a new one replaces the old when the interface language changes
 WINDOWS = []
@@ -52,6 +60,14 @@ def status_text(e):
         parts.append("AI")
     if e.get("flag"):
         parts.append("⚑")
+    if e["_voice_issue"]:
+        parts.append("🔊")
+    if e["_timing_issue"]:
+        parts.append("⏱")
+    if e.get("outdated"):
+        parts.append("⟳")
+    if e.get("reviewed"):
+        parts.append("✔")
     return " ".join(parts)
 
 
@@ -60,7 +76,7 @@ def entry_color(e):
         return COLOR_ERROR
     if e.get("ai") is not None:
         return COLOR_AI
-    if e.get("flag"):
+    if e.get("flag") or e.get("outdated"):
         return COLOR_FLAG
     if e["target"] != e["original"]:
         return COLOR_EDITED
@@ -183,6 +199,16 @@ class EntriesFilter(QSortFilterProxyModel):
             return False
         if m == "ai" and e.get("ai") is None:
             return False
+        if m == "voice" and not e["_voice_issue"]:
+            return False
+        if m == "timing" and not e["_timing_issue"]:
+            return False
+        if m == "outdated" and not e.get("outdated"):
+            return False
+        if m == "reviewed" and not e.get("reviewed"):
+            return False
+        if m == "unreviewed" and (e.get("reviewed") or e["target"] == e["original"]):
+            return False
         if self.text:
             t = self.text
             return t in e["key"] or t in e["source"].lower() or t in e["target"].lower()
@@ -208,8 +234,17 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_compare_tab(), tr("tab.compare"))
         self.tabs.addTab(self._build_ai_tab(), tr("tab.ai"))
         self.tabs.addTab(self._build_install_tab(), tr("tab.install"))
-        for i in (1, 2, 3):
+        self.voice_tab = VoiceTab(self)
+        self.tabs.addTab(self.voice_tab, tr("tab.voice"))
+        self.tabs.currentChanged.connect(lambda i: self.voice_tab.refresh() if i == 4 else None)
+        for i in (1, 2, 3, 4):
             self.tabs.setTabEnabled(i, False)
+
+        self.player = QMediaPlayer(self)
+        self.audio_out = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_out)
+        self.transcriber = None
+        self.workers = []
 
         QShortcut(QKeySequence.StandardKey.Save, self, self.save)
         QShortcut(QKeySequence("Alt+Down"), self, lambda: self.move_selection(1))
@@ -460,6 +495,9 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self.project = core.Project(path)
+            index = audio.load_index(self.project)
+            if index:
+                self.project.attach_voice(audio.VoiceLibrary(self.project, index), stt.load_transcripts(self.project))
             files = self.project.files
             for i, name in enumerate(files):
                 self.report_progress(i, len(files), tr("project.loading", name=name))
@@ -483,12 +521,59 @@ class MainWindow(QMainWindow):
             ai_item.setCheckState(Qt.CheckState.Unchecked)
             self.ai_files.addItem(ai_item)
         self.setWindowTitle(tr("project.window_title", app=tr("app.title"), project=p.title))
-        for i in (1, 2, 3):
+        for i in (1, 2, 3, 4):
             self.tabs.setTabEnabled(i, True)
         self.tabs.setCurrentIndex(1)
         start = files.index("ui.paloc") if "ui.paloc" in files else 0
         self.file_list.setCurrentRow(start)
         self.update_ai_count()
+        self.voice_tab.refresh()
+        if core.game_updated(p) and QMessageBox.question(
+                self, tr("update.group"), tr("update.ask")) == QMessageBox.StandardButton.Yes:
+            QTimer.singleShot(0, self.refresh_from_game)
+
+    def attach_voice(self, library):
+        """Use a (new) voice index and the transcripts in the checks and the detail panel."""
+        self.project.attach_voice(library, stt.load_transcripts(self.project))
+        self.update_all_file_items()
+        if self.current_file:
+            self.model.beginResetModel()
+            self.model.endResetModel()
+            self.apply_filter()
+        self.show_entry(self.current_entry)
+
+    def refresh_from_game(self):
+        """Re-read the texts after a game update; corrections stay, changed originals are marked ⟳."""
+        if not self.confirm_discard():
+            return
+        path = self.project.path
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            core.refresh_project(self.project, self.report_progress)
+        except Exception as e:
+            QMessageBox.critical(self, tr("export.error_title"), str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.project = None
+        self.open_project(path)
+        n = sum(self.project.file_stats(name)["outdated"] for name in self.project.files)
+        QMessageBox.information(self, tr("update.group"), tr("update.done", n=n))
+
+    def goto_entry(self, name, key):
+        """Show one entry in the comparison tab (clears the filter so it is visible)."""
+        row = self.project.files.index(name)
+        self.tabs.setCurrentIndex(1)
+        self.search.clear()
+        self.filter_combo.setCurrentIndex(0)
+        if self.file_list.currentRow() != row:
+            self.file_list.setCurrentRow(row)
+        self.apply_filter()
+        src_row = next((i for i, e in enumerate(self.model.entries) if e["key"] == key), None)
+        if src_row is not None:
+            index = self.proxy.mapFromSource(self.model.index(src_row, 0))
+            self.table.selectRow(index.row())
+            self.table.scrollTo(index)
 
     def update_file_item(self, item):
         name = item.data(Qt.ItemDataRole.UserRole)
@@ -502,6 +587,12 @@ class MainWindow(QMainWindow):
             extra.append(f"AI {s['ai']}")
         if s["flagged"]:
             extra.append(f"⚑{s['flagged']}")
+        if s["voice"]:
+            extra.append(f"🔊{s['voice']}")
+        if s["timing"]:
+            extra.append(f"⏱{s['timing']}")
+        if s["outdated"]:
+            extra.append(f"⟳{s['outdated']}")
         unsaved = " *" if name in self.project.dirty else ""
         item.setText(f"{name}{unsaved}\n   {tr('project.entries', n=s['total'])}  {'  '.join(extra)}")
         item.setToolTip(core.file_hint(name))
@@ -652,6 +743,34 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.issue_label)
 
         row = QHBoxLayout()
+        self.play_btn = QPushButton(tr("detail.play"))
+        self.play_btn.setToolTip(tr("detail.play_tip"))
+        self.play_btn.clicked.connect(self.play_voice)
+        row.addWidget(self.play_btn)
+        self.autoplay_check = QCheckBox(tr("detail.autoplay"))
+        self.autoplay_check.setChecked(bool(self.cfg.get("autoplay")))
+        self.autoplay_check.toggled.connect(self.on_autoplay)
+        row.addWidget(self.autoplay_check)
+        self.voice_label = QLabel(wordWrap=True)
+        row.addWidget(self.voice_label, 1)
+        self.heard_btn = QPushButton(tr("detail.transcribe"))
+        self.heard_btn.clicked.connect(self.transcribe_line)
+        row.addWidget(self.heard_btn)
+        lay.addLayout(row)
+
+        self.context_view = QPlainTextEdit(readOnly=True)
+        self.context_view.setMaximumHeight(92)
+        self.context_view.setPlaceholderText(tr("detail.context"))
+        lay.addWidget(self.context_view)
+
+        row = QHBoxLayout()
+        self.reviewed_check = QCheckBox(tr("detail.reviewed"))
+        self.reviewed_check.setToolTip(tr("detail.reviewed_tip"))
+        self.reviewed_check.toggled.connect(self.on_reviewed)
+        row.addWidget(self.reviewed_check)
+        self.outdated_btn = QPushButton(tr("detail.outdated_ok"))
+        self.outdated_btn.clicked.connect(self.resolve_outdated)
+        row.addWidget(self.outdated_btn)
         self.flag_check = QCheckBox(tr("detail.flag"))
         self.flag_check.toggled.connect(self.on_flag)
         row.addWidget(self.flag_check)
@@ -700,15 +819,129 @@ class MainWindow(QMainWindow):
         self.loading = True
         try:
             enabled = e is not None
-            for widget in (self.tgt_edit, self.flag_check, self.note_edit, self.revert_btn):
+            for widget in (self.tgt_edit, self.flag_check, self.note_edit, self.revert_btn, self.reviewed_check):
                 widget.setEnabled(enabled)
             self.src_view.setPlainText(e["source"] if e else "")
             self.tgt_edit.setPlainText(e["target"] if e else "")
             self.flag_check.setChecked(bool(e and e.get("flag")))
+            self.reviewed_check.setChecked(bool(e and e.get("reviewed")))
             self.note_edit.setText(e.get("note", "") if e else "")
             self.refresh_detail_status()
+            self.show_voice_and_context(e)
         finally:
             self.loading = False
+        if e and self.autoplay_check.isChecked() and self.voice_lines(e):
+            self.play_voice()
+
+    # ------------------------------------------------------------ voice and context
+
+    def voice_lines(self, e):
+        p = self.project
+        return p.voice.lines(e["_file"], e["key"]) if e and p and p.voice else []
+
+    def show_voice_and_context(self, e):
+        self.player.stop()
+        lines = self.voice_lines(e)
+        self.play_btn.setEnabled(bool(lines))
+        self.heard_btn.setEnabled(bool(lines) and stt.available())
+        self.outdated_btn.setVisible(bool(e and e.get("outdated")))
+        if not e:
+            self.voice_label.setText("")
+            self.context_view.setPlainText("")
+            return
+        if lines:
+            speaker, _, seconds = lines[0]
+            text = tr("detail.voice_info", speaker=audio.speaker_label(speaker), sec=seconds or "?")
+            if len(lines) > 1:
+                text += tr("detail.more_speakers", n=len(lines) - 1)
+            heard = e.get("_heard")
+            if heard:
+                text += "\n" + tr("detail.heard", text=heard["text"], pct=round(heard.get("ratio", 0) * 100))
+            self.voice_label.setText(text)
+        elif self.project.voice is None and e["_file"] in audio.VOICED_FILES:
+            self.voice_label.setText(tr("detail.no_index"))
+        else:
+            self.voice_label.setText(tr("detail.no_voice"))
+        before, after = self.project.neighbours(e["_file"], e["key"])
+        rows = [f"   {one_line(x['source'], 110)}  →  {one_line(x['target'], 110)}" for x in before]
+        rows.append(f"▶ {one_line(e['source'], 110)}")
+        rows += [f"   {one_line(x['source'], 110)}  →  {one_line(x['target'], 110)}" for x in after]
+        self.context_view.setPlainText("\n".join(rows))
+
+    def play_voice(self):
+        lines = self.voice_lines(self.current_entry)
+        if not lines:
+            return
+        try:
+            wav = self.project.voice.wav(lines[0][1])
+        except Exception as e:
+            QMessageBox.warning(self, tr("detail.play"), str(e))
+            return
+        self.player.stop()
+        self.player.setSource(QUrl.fromLocalFile(str(wav)))
+        self.player.play()
+
+    def on_autoplay(self, checked):
+        self.cfg["autoplay"] = checked
+        core.save_config(self.cfg)
+
+    def transcribe_line(self):
+        e = self.current_entry
+        lines = self.voice_lines(e)
+        if not lines:
+            return
+        p, lib = self.project, self.project.voice
+        model = self.cfg.get("stt_model", stt.DEFAULT_MODEL)
+        self.heard_btn.setEnabled(False)
+        self.voice_label.setText(self.voice_label.text() + "\n" + tr("stt.loading_model"))
+
+        def job(_progress, _stop):
+            if self.transcriber is None or self.transcriber.model_name != model:
+                self.transcriber = stt.Transcriber(model)
+            heard = self.transcriber.transcribe(lib.wav(lines[0][1]), e["source"])
+            rec = {"id": f"{e['_file']}|{e['key']}", "text": heard, "model": model,
+                   "ratio": round(stt.similarity(e["source"], heard), 3)}
+            stt.save_transcript(p, rec)
+            p.transcripts[rec["id"]] = rec
+            return rec
+
+        def done(_rec):
+            p._annotate(e["_file"], e)
+            core.refresh_issues(e)
+            self.entry_changed()
+            self.show_entry(e)
+
+        self.run_worker(job, done)
+
+    def run_worker(self, job, done, on_progress=None):
+        def finished(result):
+            self.workers.remove(worker)
+            done(result)
+
+        def failed(msg):
+            self.workers.remove(worker)
+            QMessageBox.critical(self, tr("install.error_title"), msg)
+            self.show_entry(self.current_entry)
+
+        worker = start_worker(self, job, finished, failed, on_progress)
+        self.workers.append(worker)
+        return worker
+
+    def on_reviewed(self, checked):
+        if self.loading or not self.current_entry:
+            return
+        if checked:
+            self.current_entry["reviewed"] = True
+        else:
+            self.current_entry.pop("reviewed", None)
+        self.entry_changed()
+
+    def resolve_outdated(self):
+        e = self.current_entry
+        if e and e.get("outdated"):
+            core.resolve_outdated(e)
+            self.entry_changed()
+            self.show_entry(e)
 
     def refresh_detail_status(self):
         e = self.current_entry
@@ -873,6 +1106,47 @@ class MainWindow(QMainWindow):
         blay.addLayout(row)
         lay.addWidget(box)
 
+        box = QGroupBox(tr("api.group"))
+        blay = QVBoxLayout(box)
+        blay.addWidget(QLabel(tr("api.help"), wordWrap=True))
+        row = QHBoxLayout()
+        self.api_provider = QComboBox()
+        for key, info in ai_api.PROVIDERS.items():
+            self.api_provider.addItem(info["label"], key)
+        api_cfg = self.cfg.get("api", {})
+        self.api_provider.setCurrentIndex(max(self.api_provider.findData(api_cfg.get("provider", "anthropic")), 0))
+        row.addWidget(self.api_provider, 2)
+        row.addWidget(QLabel(tr("api.model")))
+        self.api_model = QLineEdit(api_cfg.get("model", ""))
+        row.addWidget(self.api_model, 1)
+        row.addWidget(QLabel(tr("api.url")))
+        self.api_url = QLineEdit(api_cfg.get("url", ""))
+        self.api_url.setPlaceholderText(tr("api.url_hint"))
+        row.addWidget(self.api_url, 2)
+        blay.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(tr("api.key")))
+        self.api_key = QLineEdit(echoMode=QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText(tr("api.key_hint"))
+        row.addWidget(self.api_key, 2)
+        self.api_remember = QCheckBox(tr("api.remember"))
+        self.api_remember.setToolTip(tr("api.remember_tip"))
+        row.addWidget(self.api_remember)
+        self.api_run_btn = QPushButton(tr("api.run"))
+        self.api_run_btn.clicked.connect(self.run_api)
+        row.addWidget(self.api_run_btn)
+        self.api_stop_btn = QPushButton(tr("common.stop"))
+        self.api_stop_btn.setEnabled(False)
+        self.api_stop_btn.clicked.connect(lambda: self.api_worker and self.api_worker.cancel())
+        row.addWidget(self.api_stop_btn)
+        blay.addLayout(row)
+        self.api_progress = QProgressBar()
+        blay.addWidget(self.api_progress)
+        self.api_worker = None
+        self.api_provider.currentIndexChanged.connect(self.on_api_provider)
+        self.on_api_provider()
+        lay.addWidget(box)
+
         box = QGroupBox(tr("ai.group_import"))
         blay = QVBoxLayout(box)
         blay.addWidget(QLabel(tr("ai.import_help"), wordWrap=True))
@@ -1018,9 +1292,147 @@ class MainWindow(QMainWindow):
             row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
+
+        box = QGroupBox(tr("patch.group"))
+        blay = QVBoxLayout(box)
+        blay.addWidget(QLabel(tr("patch.help"), wordWrap=True))
+        row = QHBoxLayout()
+        row.addWidget(QLabel(tr("patch.author")))
+        self.patch_author = QLineEdit(self.cfg.get("patch_author", ""))
+        row.addWidget(self.patch_author, 1)
+        self.patch_reviewed = QCheckBox(tr("patch.only_reviewed"))
+        row.addWidget(self.patch_reviewed)
+        for text, slot in ((tr("patch.export"), self.export_patch),
+                           (tr("patch.apply"), self.apply_patch),
+                           (tr("patch.import"), self.import_patch)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        blay.addLayout(row)
+        lay.addWidget(box)
+
         self.install_log = QPlainTextEdit(readOnly=True)
         lay.addWidget(self.install_log, 1)
         return w
+
+    # ------------------------------------------------------------ patches
+
+    def export_patch(self):
+        self.save()
+        author = self.patch_author.text().strip()
+        self.cfg["patch_author"] = author
+        core.save_config(self.cfg)
+        p = self.project
+        default = str(core.BASE_DIR / f"crimson-desert-{p.src_lang}-{p.tgt_lang}{patch.SUFFIX}")
+        path, _ = QFileDialog.getSaveFileName(self, tr("patch.export"), default, f"*{patch.SUFFIX}")
+        if path:
+            n = patch.export_patch(p, path, author, self.patch_reviewed.isChecked())
+            self.log(tr("patch.exported", n=n, path=path))
+
+    def apply_patch(self):
+        path, _ = QFileDialog.getOpenFileName(self, tr("patch.apply"), str(core.BASE_DIR), f"*{patch.SUFFIX} *.jsonl")
+        if not path:
+            return
+        game = self.project.game_dir if self.project else self.game_edit.text().strip()
+        if QMessageBox.question(self, tr("install.confirm_title"), tr("patch.confirm", path=Path(path).name)) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            n = patch.apply_patch(game, path, self.log)
+            self.log(tr("install.done", n=n))
+        except Exception as e:
+            self.log(tr("install.error", error=e))
+            QMessageBox.critical(self, tr("install.error_title"), str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def import_patch(self):
+        path, _ = QFileDialog.getOpenFileName(self, tr("patch.import"), str(core.BASE_DIR), f"*{patch.SUFFIX} *.jsonl")
+        if not path:
+            return
+        self.save()
+        try:
+            applied, skipped = patch.import_into_project(self.project, path)
+        except Exception as e:
+            QMessageBox.critical(self, tr("ai.import_error_title"), str(e))
+            return
+        self.log(tr("patch.imported", n=applied, skipped=skipped, path=path))
+        self.update_all_file_items()
+        if applied:
+            self.filter_combo.setCurrentIndex(FILTERS.index("ai"))
+            self.select_file(self.file_list.currentItem())
+            self.tabs.setCurrentIndex(1)
+
+    # ------------------------------------------------------------ AI through an API
+
+    def on_api_provider(self):
+        provider = self.api_provider.currentData()
+        self.api_model.setPlaceholderText(ai_api.model_default(provider) or tr("api.model_hint"))
+        saved = self.cfg.get("api_keys", {}).get(provider, "")
+        self.api_key.setText(saved)
+        self.api_remember.setChecked(bool(saved))
+
+    def run_api(self):
+        task = self.last_task
+        if not task:
+            tasks = core.list_ai_tasks(self.project)
+            task = tasks[0]["path"] if tasks else None
+        if not task:
+            QMessageBox.information(self, tr("ai.no_tasks_title"), tr("ai.no_tasks"))
+            return
+        provider = self.api_provider.currentData()
+        model = self.api_model.text().strip() or ai_api.model_default(provider)
+        url = self.api_url.text().strip() or None
+        key = self.api_key.text().strip() or ai_api.api_key_for(provider, self.cfg)
+        if not model or (not key and not ai_api.is_local(url)):
+            QMessageBox.warning(self, tr("api.group"), tr("api.missing"))
+            return
+        self.cfg["api"] = {"provider": provider, "model": self.api_model.text().strip(),
+                           "url": self.api_url.text().strip()}
+        keys = self.cfg.setdefault("api_keys", {})
+        if self.api_remember.isChecked() and self.api_key.text().strip():
+            keys[provider] = self.api_key.text().strip()
+        else:
+            keys.pop(provider, None)
+        core.save_config(self.cfg)
+        if QMessageBox.question(self, tr("api.group"), tr("api.confirm", task=Path(task).name, model=model)) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.ai_log.appendPlainText(tr("api.started", task=task, model=model))
+
+        def progress(i, n, label):
+            self.api_progress.setMaximum(max(n, 1))
+            self.api_progress.setValue(i)
+            self.api_progress.setFormat(f"{label}  %v / %m")
+
+        def job(progress_cb, stop):
+            return ai_api.run_task(task, provider, model, key, url, progress_cb, stop,
+                                   log=lambda text: progress_cb(-1, -1, text))
+
+        def on_progress(i, n, label):
+            if i < 0:
+                self.ai_log.appendPlainText(label)
+            else:
+                progress(i, n, label)
+
+        def done(result):
+            self.api_worker = None
+            self.api_run_btn.setEnabled(True)
+            self.api_stop_btn.setEnabled(False)
+            parts, fixes, rejected = result
+            self.ai_log.appendPlainText(tr("api.finished", parts=parts, n=fixes, bad=rejected))
+            self.last_task = Path(task)
+
+        def failed(msg):
+            self.api_worker = None
+            self.api_run_btn.setEnabled(True)
+            self.api_stop_btn.setEnabled(False)
+            self.ai_log.appendPlainText(tr("install.error", error=msg))
+
+        self.api_run_btn.setEnabled(False)
+        self.api_stop_btn.setEnabled(True)
+        self.api_worker = start_worker(self, job, done, failed, on_progress)
 
     def log(self, text):
         self.install_log.appendPlainText(text)
@@ -1036,7 +1448,7 @@ class MainWindow(QMainWindow):
         if not changes:
             self.log(tr("install.no_changes"))
             return []
-        names = [n for n, _ in changes]
+        names = [c[0] for c in changes]
         self.log(tr("install.pending", n=len(names), names=", ".join(names)))
         return names
 

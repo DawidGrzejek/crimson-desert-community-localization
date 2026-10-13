@@ -61,7 +61,7 @@ def main():
             def bad(msg):
                 nonlocal errors
                 errors += 1
-                print(f"ERROR {where}: {msg}")
+                print(f"ERROR {where}: {msg}")  # noqa: B023 – called within the same iteration
 
             try:
                 rec = json.loads(line)
