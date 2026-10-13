@@ -1,0 +1,3 @@
+PyQt6
+lz4
+cryptography

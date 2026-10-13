@@ -1,0 +1,15 @@
+# Only the translator's own files are published. Everything else in this
+# folder (the base localization tool, game texts, projects, AI tasks,
+# backups, settings) stays local.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/cd_core.py
+!/cd_translator.py
+!/i18n.py
+!/ai_check.py
+!/lang/
+!/start_translator.sh
+!/requirements-translator.txt
+__pycache__/
