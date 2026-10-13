@@ -13,3 +13,10 @@
 !/start_translator.sh
 !/requirements-translator.txt
 __pycache__/
+!/tools/
+/tools/*
+!/tools/README.md
+!/tools/paz_parse.py
+!/tools/paz_crypto.py
+!/tools/paz_repack.py
+!/tools/Meta_Patch.py

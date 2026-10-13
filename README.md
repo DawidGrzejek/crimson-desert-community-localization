@@ -57,20 +57,20 @@ Kinds of problems fixed in Polish so far:
 
 - Crimson Desert (Steam), on Linux / Steam Deck or Windows.
 - Python 3.10+.
-- The **PAZ helper scripts** in a `tools/` folder next to the program: `paz_parse.py`,
-  `paz_crypto.py`, `paz_repack.py` and `Meta_Patch.py`. They read and repack the game's archives
-  and are not part of this repository. They come with the *Crimson Desert Localization Tool*, and
-  the archive scripts are based on
+- The **PAZ helper scripts** in `tools/` (`paz_parse.py`, `paz_crypto.py`, `paz_repack.py`,
+  `Meta_Patch.py`) read and repack the game's archives. They are third-party scripts, included
+  with credit: they come from the
+  [Crimson Desert Localization Tool on Nexus Mods](https://www.nexusmods.com/crimsondesert/mods/103?tab=files&file_id=259),
+  and the archive scripts are based on
   [lazorr410/crimson-desert-unpacker](https://github.com/lazorr410/crimson-desert-unpacker) (MIT).
-  The `paz_parse.py` you use must recognise encrypted `.paloc` files.
+  See [tools/README.md](tools/README.md).
 
 ## Installation (Linux / Steam Deck)
 
 ```bash
-# 1. Put the files of this repository into the folder that contains tools/
+# 1. Download the program
 git clone https://github.com/DawidGrzejek/crimson-desert-community-localization.git
 cd crimson-desert-community-localization
-# (copy or link the tools/ folder here)
 
 # 2. Create a virtual environment and install the dependencies
 python3 -m venv .venv
@@ -117,7 +117,8 @@ it is free and non-commercial, and it doesn't use Pearl Abyss logos or trademark
 translations are not distributed here. Sharing them is on hold until it is clarified with
 Pearl Abyss.
 
-The tool's source code is released under the [MIT License](LICENSE).
+The tool's own source code is released under the [MIT License](LICENSE). The scripts in `tools/`
+belong to their respective authors (see [tools/README.md](tools/README.md)).
 
 ---
 
