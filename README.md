@@ -21,15 +21,15 @@ can be handled the same way, and contributors are welcome.
 
 | Language | Status | Corrected lines | Notes |
 |---|---|---|---|
-| 🇵🇱 Polish | 🔄 In progress | **25 382** | NPC lines being matched to the English voice-over |
+| 🇵🇱 Polish | 🔄 In progress | **34 495** | all voiced lines reviewed; waiting for in-game testing |
 
-Polish details (corrections per game file, as of 2026-10-13):
+Polish details (corrections per game file, as of 2026-10-14):
 
 | File | What it contains | Corrections | Review |
 |---|---|---|---|
 | `sequencer.paloc` | cutscene subtitles | 7 862 | ✅ done |
-| `questdialog.paloc` | quest dialogue | 10 380 | 🔄 46 / 71 batches |
-| `aidialog.paloc` | NPC lines in the open world | 6 767 | ⏳ first pass done, full review pending |
+| `questdialog.paloc` | quest dialogue | 13 856 | ✅ done |
+| `aidialog.paloc` | NPC lines in the open world | 12 404 | ✅ done |
 | `ui.paloc` and others | interface, knowledge, quests | 373 | ✅ critical errors (broken tags, missing buttons) fixed |
 
 Kinds of problems fixed in Polish so far:
@@ -173,10 +173,10 @@ polskiego: w wielu miejscach napisy nie zgadzają się z tym, co postacie mówi�
 dubbingu. Program porównuje dwa języki gry obok siebie i pozwala poprawiać tłumaczenie ręcznie
 albo z pomocą agenta AI (np. Claude Code). Poprawki wgrywa do gry, zawsze z kopią zapasową.
 
-**Postęp polskiej wersji:** poprawiono **25 382** kwestie.
+**Postęp polskiej wersji:** poprawiono **34 495** kwestii.
 - Napisy do scenek (`sequencer.paloc`): przejrzane w całości.
-- Dialogi zadań (`questdialog.paloc`): przejrzane 46 z 71 paczek.
-- Kwestie NPC (`aidialog.paloc`): czekają na pełny przegląd.
+- Dialogi zadań (`questdialog.paloc`): przejrzane w całości.
+- Kwestie NPC (`aidialog.paloc`): przejrzane w całości.
 
 Najważniejsze funkcje: odsłuch oryginalnego głosu przy każdej kwestii, rozpoznawanie mowy, które
 wskazuje napisy niezgodne z nagraniem, kontrola długości i tempa czytania, raport spójności nazw,
