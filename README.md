@@ -21,7 +21,7 @@ can be handled the same way, and contributors are welcome.
 
 | Language | Status | Corrected lines | Notes |
 |---|---|---|---|
-| 🇵🇱 Polish | 🔄 In progress | **34 495** | all voiced lines reviewed; waiting for in-game testing |
+| 🇵🇱 Polish | 🔄 In progress | **40 856** | all voiced lines and quest texts reviewed; waiting for in-game testing |
 
 Polish details (corrections per game file, as of 2026-10-14):
 
@@ -173,7 +173,7 @@ polskiego: w wielu miejscach napisy nie zgadzają się z tym, co postacie mówi�
 dubbingu. Program porównuje dwa języki gry obok siebie i pozwala poprawiać tłumaczenie ręcznie
 albo z pomocą agenta AI (np. Claude Code). Poprawki wgrywa do gry, zawsze z kopią zapasową.
 
-**Postęp polskiej wersji:** poprawiono **34 495** kwestii.
+**Postęp polskiej wersji:** poprawiono **40 856** kwestii.
 - Napisy do scenek (`sequencer.paloc`): przejrzane w całości.
 - Dialogi zadań (`questdialog.paloc`): przejrzane w całości.
 - Kwestie NPC (`aidialog.paloc`): przejrzane w całości.
